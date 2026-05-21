@@ -1,0 +1,8 @@
+/target
+save.json
+/data
+/lists
+app.log
+.idea
+lists/proxies.txt
+lists/accounts.txt
