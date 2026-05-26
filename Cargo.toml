@@ -1,6 +1,6 @@
 [package]
 name = "twitchdrops_miner"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 
 [dependencies]
@@ -20,3 +20,12 @@ tracing-appender = "0.2.5"
 auto-launch = "0.6.0"
 rand = "0.10.1"
 chrono = "0.4.44"
+
+# === Лицензионная система ===
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+base64 = "0.22"
+whoami = "1.5"
+
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
