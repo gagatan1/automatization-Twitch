@@ -3,6 +3,10 @@ name = "twitchdrops_miner"
 version = "1.0.2"
 edition = "2024"
 
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
+
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1.52.3", features = ["full"] }
@@ -20,3 +24,10 @@ tracing-appender = "0.2.5"
 auto-launch = "0.6.0"
 rand = "0.10.1"
 chrono = "0.4.44"
+
+# === License system ===
+ed25519-dalek = { version = "2.1", features = ["rand_core", "std"] }
+base64 = "0.22"
+sha2 = "0.10"
+whoami = "1.6"
+hex = "0.4"
