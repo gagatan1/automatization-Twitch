@@ -2,8 +2,8 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, error::Error, pat
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::{rng, seq::{IndexedRandom, SliceRandom}};
-use tokio::{fs::{self}, sync::{Notify, broadcast::{self, Receiver, error::TryRecvError}, watch::Sender}, time::{sleep}};
-use tracing::{debug, info};
+use tokio::{fs::{self}, sync::{Notify, Semaphore, broadcast::{self, Receiver, error::TryRecvError}, watch::Sender}, time::{sleep}};
+use tracing::{debug, info, warn};
 use tracing_appender::rolling;
 use tracing_subscriber::fmt::{time::ChronoLocal, writer::BoxMakeWriter};
 use twitch_gql_rs::{TwitchClient, client_type::ClientType, error::ClaimDropError, structs::DropCampaigns};
@@ -17,6 +17,15 @@ use crate::{config::*, r#static::*, stream::*, webhook::{WebhookSendFormat, webh
 
 const STREAM_SLEEP: u64 = 59;
 const MAX_COUNT: u64 = 3;
+const BROADCAST_CHANNEL_CAPACITY: usize = 4096;
+const CLAIM_MAX_ATTEMPTS: u32 = 10;
+const CLAIM_RETRY_SLEEP_SECS: u64 = 5;
+const DROP_SYNC_POLL_SECS: u64 = 30;
+const FINALIZE_ROUNDS: u32 = 3;
+const FINALIZE_ROUND_DELAY_SECS: u64 = 60;
+const FINALIZE_CONCURRENCY: usize = 50;
+const CLAIM_CHECK_ROUNDS: u32 = 1;
+const CLAIM_CHECK_ROUND_DELAY_SECS: u64 = 0;
 
 async fn create_client(home_dir: &Path, proxies: &[String]) -> Result<(), Box<dyn Error>> {
     // ... (весь код create_client оставлен без изменений — он уже хороший)
@@ -118,7 +127,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let games = config.loaded_games().await?;
 
-    let items = vec!["Add account", "Start farming"];
+    let items = vec!["Add account", "Start farming", "Check & claim drops"];
     loop {
         let select = if !games.is_empty() {
             1
@@ -158,6 +167,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 main_logic(client, grouped, home_dir, &games, config.discord_webhook_url.clone(), &proxies).await?;
+            },
+            2 => {
+                claim_check_logic(home_dir).await?;
             },
             _ => {}
         }
@@ -211,8 +223,6 @@ async fn main_logic(
     // ... (весь остальной код main_logic остаётся как у тебя, только исправляем опечатку)
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let (drop_id_tx, mut drop_id_rx) = tokio::sync::watch::channel(String::new());
-    let (channel_tx, channel_rx) = broadcast::channel(100);
-    let channel_rx2 = channel_tx.subscribe();
 
     let notify = Arc::new(Notify::new());
     let drop_campaigns = Arc::new(current_campaigns.clone());
@@ -225,6 +235,10 @@ async fn main_logic(
         return Err("Didn't find accounts".into());
     };
 
+    let broadcast_capacity = BROADCAST_CHANNEL_CAPACITY.max(clients.len().saturating_mul(2));
+    let (channel_tx, channel_rx) = broadcast::channel(broadcast_capacity);
+    let channel_rx2 = channel_tx.subscribe();
+
     let webhook_is_active = if !webhook_url.is_empty() {   // ← исправлено
         webhook_message_worker(webhook_url, webhook_rx, proxies).await;
         true
@@ -234,20 +248,23 @@ async fn main_logic(
 
     watch_sync(clients.clone(), channel_rx, notify.clone()).await;
     info!("Watch synchronization task has been successfully initiated");
-    drop_sync(clients.clone(), drop_id_tx, drop_cash_dir, channel_rx2, notify.clone(), webhook_tx, webhook_is_active).await;
+    drop_sync(clients.clone(), drop_id_tx.clone(), drop_cash_dir.clone(), channel_rx2, notify.clone(), webhook_tx, webhook_is_active).await;
     info!("Drop progress tracker is active");
     filter_streams(client.clone(), drop_campaigns.clone()).await;
     info!("Stream filtering has begun");
     update_stream(channel_tx, notify).await;
     info!("Stream priority updated");
 
-    // ... (весь остальной код pending_drops и while — оставь как есть)
     let mut pending_drops: HashSet<String> = HashSet::new();
+    let mut campaign_drop_ids: HashSet<String> = HashSet::new();
     {
         let cash = DROP_CACHE.lock().await.clone();
-        for game_campaign in current_campaigns {
+        for game_campaign in &current_campaigns {
             for campaign in game_campaign {
                 let mut campaign_details = retry!(client.get_campaign_details(&campaign.id));
+                for drop in &campaign_details.timeBasedDrops {
+                    campaign_drop_ids.insert(drop.id.clone());
+                }
                 for (_, claimed_drops) in &cash {
                     for drop_id_cache in claimed_drops {
                         if let Some(pos) = campaign_details.timeBasedDrops.iter().position(|d| d.id == *drop_id_cache) {
@@ -270,6 +287,9 @@ async fn main_logic(
         }
     }
 
+    info!("Farming phase complete. Running post-farm drop verification...");
+    finalize_all_account_drops(clients, &campaign_drop_ids, &drop_cash_dir, &drop_id_tx).await;
+
     info!("✅ All drops for the selected game are claimed!");
     Ok(())
 }
@@ -285,10 +305,15 @@ async fn watch_sync (clients: Vec<Arc<TwitchClient>>, rx: Receiver<Channel>, not
             let mut watching = rx.recv().await.unwrap();
             loop {
                 match rx.try_recv() {
-                    Ok(channel) => watching = channel,
-                    Err(TryRecvError::Closed) => tracing::error!("Closed"),
+                    Err(TryRecvError::Closed) => break,
+                    Ok(channel) => {
+                        watching = channel;
+                        while let Ok(latest) = rx.try_recv() {
+                            watching = latest;
+                        }
+                    }
                     Err(_) => {}
-                };
+                }
 
                 if old_stream_name.is_empty() || old_stream_name != watching.channel_login {
                     info!("Now actively watching channel {}", watching.channel_login);
@@ -329,15 +354,7 @@ async fn watch_sync (clients: Vec<Arc<TwitchClient>>, rx: Receiver<Channel>, not
 }
 
 async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_path: PathBuf, rx_watch: broadcast::Receiver<Channel>, notify: Arc<Notify>, webhook_tx: tokio::sync::mpsc::Sender<WebhookSendFormat>, webhook_is_active: bool) {
-    if !cache_path.exists() {
-        retry!(fs::write(&cache_path, "{}"));
-    } else {
-        let mut cache = DROP_CACHE.lock().await;
-        let cache_str = retry!(fs::read_to_string(&cache_path));
-        let cache_vec: HashMap<String, HashSet<String>> = serde_json::from_str(&cache_str).unwrap();
-        *cache = cache_vec;
-        drop(cache);
-    }
+    load_drop_cache(&cache_path).await.expect("Failed to load drop cache");
 
     let bars = Arc::new(MultiProgress::new());
 
@@ -350,10 +367,12 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
         let bars = bars.clone();
 
         tokio::spawn(async move {
-            let mut last_claimed = String::new();
+            let mut claimed_drops: HashSet<String> = {
+                let cache = DROP_CACHE.lock().await;
+                cache.get(&account_cache_key(&client)).cloned().unwrap_or_default()
+            };
             let mut last_message = String::new();
 
-            //bar
             let bar = bars.add(ProgressBar::new(1));
             bar.set_style(ProgressStyle::with_template("[{bar:40.cyan/blue}] {percent:.1}% ({pos}/{len} min) {msg}").unwrap());
             bar.set_message("Initialization...");
@@ -364,60 +383,63 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
             let mut last_known_drop_id = String::new();
             loop {
                 match rx_watch.try_recv() {
+                    Err(TryRecvError::Closed) => break,
                     Ok(new_watch) => {
                         watching = new_watch;
-                        last_claimed.clear();
                         last_drop_id.clear();
+                        while let Ok(channel) = rx_watch.try_recv() {
+                            watching = channel;
+                        }
                     }
-                    Err(TryRecvError::Closed) => break,
                     Err(_) => {}
                 }
 
-            let drop_progress = retry!(client.get_current_drop_progress_on_channel(&watching.channel_login));
-                    
-            // ИСХОДНАЯ логика:
-            let mut should_claim = !drop_progress.dropID.is_empty() 
-                && drop_progress.currentMinutesWatched >= drop_progress.requiredMinutesWatched 
-                && drop_progress.dropID != last_claimed;
-                    
-            // НОВАЯ ЛОГИКА: Отлавливаем завершение последнего дропа
-            let mut claim_target_id = drop_progress.dropID.clone();
-                    
-            if drop_progress.dropID.is_empty() && !last_known_drop_id.is_empty() && last_known_drop_id != last_claimed {
-                // Дроп пропал из активных, хотя мы его не клеймили. 
-                // Скорее всего, это был последний дроп, и он завершился.
-                tracing::info!("Active drop disappeared. Attempting to claim final drop: {}", last_known_drop_id);
-                should_claim = true;
-                claim_target_id = last_known_drop_id.clone();
-            }
-        
-            // Обновляем память о последнем живом дропе
-            if !drop_progress.dropID.is_empty() {
-                last_known_drop_id = drop_progress.dropID.clone();
-            }
-        
-            let mut cache = DROP_CACHE.lock().await;
-        
-            // Обновляем блок клейма, используя claim_target_id
-            if should_claim && !claim_target_id.is_empty() {
-                // Вызываем функцию клейма (ее мы тоже чуть поправим ниже)
-                if claim_drop(&client, &claim_target_id).await.is_ok() {
-                    info!("Drop claimed: {}", claim_target_id);
-                
-                    tx.send(claim_target_id.clone()).unwrap_or_else(|_| tracing::error!("tx closed"));
-                    cache.entry(client.user_id.clone().unwrap_or_default()).or_default().insert(claim_target_id.clone());
-                    last_claimed = claim_target_id.clone();
-                
-                    let cache_string = serde_json::to_string_pretty(&*cache).unwrap();
-                    retry!(fs::write(&cache_path, cache_string.as_bytes()));
-                } else {
-                    // Если клейм не удался (например, стример просто оффнулся на 50% дропа)
-                    tracing::warn!("Failed to claim hidden drop (streamer might be offline): {}", claim_target_id);
-                    last_known_drop_id.clear(); // Сбрасываем, чтобы не спамить попытками
+                let Some(drop_progress) = retry_or_log(|| client.get_current_drop_progress_on_channel(&watching.channel_login)).await else {
+                    sleep(Duration::from_secs(DROP_SYNC_POLL_SECS)).await;
+                    continue;
+                };
+
+                if !drop_progress.dropID.is_empty()
+                    && !last_known_drop_id.is_empty()
+                    && drop_progress.dropID != last_known_drop_id
+                    && !claimed_drops.contains(&last_known_drop_id)
+                {
+                    tracing::info!(
+                        "Drop ID changed ({} -> {}). Claiming previous drop first.",
+                        last_known_drop_id,
+                        drop_progress.dropID
+                    );
+                    try_claim_and_record(&client, &last_known_drop_id, &cache_path, &tx, &mut claimed_drops).await;
                 }
-            }
-        
-            drop(cache);
+
+                let mut should_claim = !drop_progress.dropID.is_empty()
+                    && drop_progress.currentMinutesWatched >= drop_progress.requiredMinutesWatched
+                    && !claimed_drops.contains(&drop_progress.dropID);
+
+                let mut claim_target_id = drop_progress.dropID.clone();
+
+                if drop_progress.dropID.is_empty()
+                    && !last_known_drop_id.is_empty()
+                    && !claimed_drops.contains(&last_known_drop_id)
+                {
+                    tracing::info!("Active drop disappeared. Attempting to claim: {}", last_known_drop_id);
+                    should_claim = true;
+                    claim_target_id = last_known_drop_id.clone();
+                }
+
+                if !drop_progress.dropID.is_empty() {
+                    last_known_drop_id = drop_progress.dropID.clone();
+                }
+
+                if should_claim && !claim_target_id.is_empty() {
+                    if !try_claim_and_record(&client, &claim_target_id, &cache_path, &tx, &mut claimed_drops).await {
+                        warn!(
+                            "Failed to claim drop {} for {} (will retry on next poll)",
+                            claim_target_id,
+                            client.login.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                }
 
                 let message = if drop_progress.dropID.is_empty() {
                     "No active drop • waiting..."
@@ -437,8 +459,7 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
 
                         let (game_name, game_avatar_url) = if drop_progress.dropID.is_empty() {
                             ("None".to_string(), "None".to_string())
-                        } else {
-                            let inv = retry!(client.get_inventory());
+                        } else if let Some(inv) = retry_or_log(|| client.get_inventory()).await {
                             if let Some(found) = inv.inventory.dropCampaignsInProgress.as_ref().and_then(|campaigns| {
                                 campaigns.iter().find(|campaign| {
                                     campaign.timeBasedDrops.iter().any(|time_based| {
@@ -446,10 +467,12 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
                                     })
                                 })
                             }) {
-                                (found.game.name.clone(), found.imageURL.clone())   
+                                (found.game.name.clone(), found.imageURL.clone())
                             } else {
                                 (drop_progress.game.map(|game| game.displayName).unwrap_or_else(|| "Unknown".to_string()), "None".to_string())
                             }
+                        } else {
+                            (drop_progress.game.map(|game| game.displayName).unwrap_or_else(|| "Unknown".to_string()), "None".to_string())
                         };
 
                         let payload = WebhookSendFormat {
@@ -468,7 +491,7 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
                 last_message = message.to_string();
 
                 let message = format!("{} | {}", client.login.clone().unwrap_or_default(), message);
-            
+
                 if drop_progress.dropID != last_drop_id {
                     last_drop_id = drop_progress.dropID.clone();
                     bar.set_position(0);
@@ -477,34 +500,98 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
                 } else {
                     bar.set_message(message);
                 }
-            
+
                 bar.set_length(drop_progress.requiredMinutesWatched.max(1));
                 bar.set_position(drop_progress.currentMinutesWatched);
-            
-                if drop_progress.dropID.is_empty() || (drop_progress.currentMinutesWatched >= drop_progress.requiredMinutesWatched && drop_progress.dropID != last_claimed) {
-                    debug!("Not claiming yet: dropID: {}, currentMinutesWatched: {}, requiredMinutesWatched: {}, lastClaimed: {}", drop_progress.dropID, drop_progress.currentMinutesWatched, drop_progress.requiredMinutesWatched, last_claimed);
+
+                if drop_progress.dropID.is_empty()
+                    || (drop_progress.currentMinutesWatched >= drop_progress.requiredMinutesWatched
+                        && !drop_progress.dropID.is_empty()
+                        && !claimed_drops.contains(&drop_progress.dropID))
+                {
+                    debug!(
+                        "Not claiming yet: dropID: {}, currentMinutesWatched: {}, requiredMinutesWatched: {}, claimed: {:?}",
+                        drop_progress.dropID,
+                        drop_progress.currentMinutesWatched,
+                        drop_progress.requiredMinutesWatched,
+                        claimed_drops
+                    );
                     notify.notify_one();
-                    if drop_progress.dropID.is_empty() {
-                        let mut lock = CHANNEL_IDS.lock().await;
-                        lock.retain(|c| c.channel_id != watching.channel_id);
-                    }
                 }
 
-                sleep(Duration::from_secs(30)).await;
+                sleep(Duration::from_secs(DROP_SYNC_POLL_SECS)).await;
             }
         });
+    }
+}
+
+fn account_cache_key(client: &Arc<TwitchClient>) -> String {
+    client
+        .user_id
+        .clone()
+        .or_else(|| client.login.clone())
+        .unwrap_or_default()
+}
+
+async fn record_claimed_drop(
+    client: &Arc<TwitchClient>,
+    drop_id: &str,
+    cache_path: &Path,
+    drop_id_tx: &Sender<String>,
+) {
+    let key = account_cache_key(client);
+    let mut cache = DROP_CACHE.lock().await;
+    cache.entry(key).or_default().insert(drop_id.to_string());
+    if let Ok(cache_string) = serde_json::to_string_pretty(&*cache) {
+        if let Err(error) = retry_backup(|| fs::write(cache_path, cache_string.as_bytes())).await {
+            warn!("Failed to persist drop cache: {error}");
+        }
+    }
+    drop(cache);
+    let _ = drop_id_tx.send(drop_id.to_string());
+}
+
+async fn try_claim_and_record(
+    client: &Arc<TwitchClient>,
+    drop_id: &str,
+    cache_path: &Path,
+    drop_id_tx: &Sender<String>,
+    claimed_drops: &mut HashSet<String>,
+) -> bool {
+    if claimed_drops.contains(drop_id) {
+        return true;
+    }
+    if claim_drop(client, drop_id).await.is_ok() {
+        info!(
+            "Drop claimed: {} ({})",
+            drop_id,
+            client.login.as_deref().unwrap_or("unknown")
+        );
+        record_claimed_drop(client, drop_id, cache_path, drop_id_tx).await;
+        claimed_drops.insert(drop_id.to_string());
+        true
+    } else {
+        false
     }
 }
 
 async fn claim_drop(client: &Arc<TwitchClient>, drop_progress_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut attempts = 0;
     loop {
-        if attempts >= 3 {
+        if attempts >= CLAIM_MAX_ATTEMPTS {
             return Err("Maximum claim attempts reached or drop not eligible yet".into());
         }
         attempts += 1;
 
-        let inv = retry!(client.get_inventory());
+        let inv = match retry_backup(|| client.get_inventory()).await {
+            Ok(inv) => inv,
+            Err(error) => {
+                warn!("Failed to get inventory for claim: {error}");
+                tokio::time::sleep(Duration::from_secs(CLAIM_RETRY_SLEEP_SECS)).await;
+                continue;
+            }
+        };
+
         if let Some(campaigns_in_progress) = inv.inventory.dropCampaignsInProgress {
             for in_progress in campaigns_in_progress {
                 for time_based in in_progress.timeBasedDrops {
@@ -513,16 +600,288 @@ async fn claim_drop(client: &Arc<TwitchClient>, drop_progress_id: &str) -> Resul
                             match client.claim_drop(id).await {
                                 Ok(_) => return Ok(()),
                                 Err(ClaimDropError::DropAlreadyClaimed) => return Ok(()),
-                                Err(e) => tracing::error!("Error claiming drop: {e}")
+                                Err(error) => tracing::error!("Error claiming drop: {error}")
                             }
                         }
                     }
                 }
             }
         }
-        // Обязательная пауза перед следующей попыткой
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(CLAIM_RETRY_SLEEP_SECS)).await;
     }
+}
+
+async fn verify_account_drops(
+    client: &Arc<TwitchClient>,
+    campaign_drop_ids: &HashSet<String>,
+    cache_path: &Path,
+    drop_id_tx: &Sender<String>,
+) -> usize {
+    let mut claimed_count = 0;
+    let mut claimed_drops: HashSet<String> = {
+        let cache = DROP_CACHE.lock().await;
+        cache.get(&account_cache_key(client)).cloned().unwrap_or_default()
+    };
+
+    let pending: Vec<String> = campaign_drop_ids
+        .iter()
+        .filter(|id| !claimed_drops.contains(*id))
+        .cloned()
+        .collect();
+
+    for drop_id in pending {
+        if try_claim_and_record(client, &drop_id, cache_path, drop_id_tx, &mut claimed_drops).await {
+            claimed_count += 1;
+        }
+    }
+
+    if let Some(inv) = retry_or_log(|| client.get_inventory()).await {
+        if let Some(campaigns_in_progress) = inv.inventory.dropCampaignsInProgress {
+            for in_progress in campaigns_in_progress {
+                for time_based in in_progress.timeBasedDrops {
+                    if !campaign_drop_ids.contains(&time_based.id) || claimed_drops.contains(&time_based.id) {
+                        continue;
+                    }
+                    if time_based.self_drop.dropInstanceID.is_some()
+                        && try_claim_and_record(client, &time_based.id, cache_path, drop_id_tx, &mut claimed_drops).await
+                    {
+                        claimed_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    claimed_count
+}
+
+async fn finalize_all_account_drops(
+    clients: Vec<Arc<TwitchClient>>,
+    campaign_drop_ids: &HashSet<String>,
+    cache_path: &Path,
+    drop_id_tx: &Sender<String>,
+) {
+    if campaign_drop_ids.is_empty() {
+        return;
+    }
+
+    info!(
+        "Verifying drops for {} accounts ({} drop types in campaign)",
+        clients.len(),
+        campaign_drop_ids.len()
+    );
+
+    let semaphore = Arc::new(Semaphore::new(FINALIZE_CONCURRENCY));
+    let mut total_claimed = 0usize;
+
+    for round in 1..=FINALIZE_ROUNDS {
+        info!("Verification round {round}/{FINALIZE_ROUNDS}");
+        let mut handles = Vec::new();
+
+        for client in clients.clone() {
+            let semaphore = semaphore.clone();
+            let campaign_drop_ids = campaign_drop_ids.clone();
+            let cache_path = cache_path.to_path_buf();
+            let drop_id_tx = drop_id_tx.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                verify_account_drops(&client, &campaign_drop_ids, &cache_path, &drop_id_tx).await
+            }));
+        }
+
+        for handle in handles {
+            if let Ok(count) = handle.await {
+                total_claimed += count;
+            }
+        }
+
+        if round < FINALIZE_ROUNDS {
+            sleep(Duration::from_secs(FINALIZE_ROUND_DELAY_SECS)).await;
+        }
+    }
+
+    info!("Post-farm verification claimed {total_claimed} additional drops");
+}
+
+async fn load_drop_cache(cache_path: &Path) -> Result<(), Box<dyn Error>> {
+    if !cache_path.exists() {
+        retry!(fs::write(cache_path, "{}"));
+    } else {
+        let mut cache = DROP_CACHE.lock().await;
+        let cache_str = retry!(fs::read_to_string(cache_path));
+        let cache_vec: HashMap<String, HashSet<String>> = serde_json::from_str(&cache_str).unwrap_or_default();
+        *cache = cache_vec;
+    }
+    Ok(())
+}
+
+async fn persist_drop_cache(cache_path: &Path) {
+    let cache = DROP_CACHE.lock().await;
+    if let Ok(cache_string) = serde_json::to_string_pretty(&*cache) {
+        if let Err(error) = retry_backup(|| fs::write(cache_path, cache_string.as_bytes())).await {
+            warn!("Failed to persist drop cache: {error}");
+        }
+    }
+}
+
+async fn verify_account_all_claimable(
+    client: &Arc<TwitchClient>,
+    cache_path: &Path,
+) -> usize {
+    let account_key = account_cache_key(client);
+    let login = client.login.as_deref().unwrap_or("unknown");
+    let mut claimed_drops: HashSet<String> = {
+        let cache = DROP_CACHE.lock().await;
+        cache.get(&account_key).cloned().unwrap_or_default()
+    };
+
+    let Some(inv) = retry_or_log(|| client.get_inventory()).await else {
+        warn!("Failed to load inventory for {login}");
+        return 0;
+    };
+
+    let Some(campaigns_in_progress) = inv.inventory.dropCampaignsInProgress else {
+        return 0;
+    };
+
+    let mut ready_drops: Vec<(String, String, String)> = Vec::new();
+    for in_progress in campaigns_in_progress {
+        let game_name = in_progress.game.name.clone();
+        for time_based in in_progress.timeBasedDrops {
+            if let Some(instance_id) = &time_based.self_drop.dropInstanceID {
+                if claimed_drops.contains(&time_based.id) {
+                    continue;
+                }
+                ready_drops.push((time_based.id.clone(), instance_id.clone(), game_name.clone()));
+            }
+        }
+    }
+
+    if ready_drops.is_empty() {
+        return 0;
+    }
+
+    let mut claimed_count = 0usize;
+    let mut cache_updated = false;
+
+    for (drop_id, instance_id, game_name) in ready_drops {
+        match client.claim_drop(&instance_id).await {
+            Ok(_) => {
+                info!("Claimed drop from {game_name} ({login})");
+                claimed_drops.insert(drop_id.clone());
+                claimed_count += 1;
+                cache_updated = true;
+            }
+            Err(ClaimDropError::DropAlreadyClaimed) => {
+                claimed_drops.insert(drop_id);
+                cache_updated = true;
+            }
+            Err(error) => {
+                warn!("Failed to claim drop from {game_name} ({login}): {error}");
+            }
+        }
+    }
+
+    if cache_updated {
+        let mut cache = DROP_CACHE.lock().await;
+        cache.entry(account_key).or_default().extend(claimed_drops);
+        drop(cache);
+        persist_drop_cache(cache_path).await;
+    }
+
+    claimed_count
+}
+
+async fn claim_check_logic(home_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let clients = {
+        let lock = ACCOUNTS.lock().await;
+        lock.clone().ok_or("No accounts loaded")?
+    };
+
+    if clients.is_empty() {
+        return Err("No accounts loaded".into());
+    }
+
+    let cache_path = home_dir.join("cash.json");
+    load_drop_cache(&cache_path).await?;
+
+    let semaphore = Arc::new(Semaphore::new(FINALIZE_CONCURRENCY));
+    let progress = ProgressBar::new(clients.len() as u64);
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} accounts | {msg}")
+            .unwrap(),
+    );
+    progress.set_message("scanning inventory...");
+
+    println!(
+        "\n=== Claim check: scanning {} accounts (all games) ===\n",
+        clients.len()
+    );
+
+    let mut total_claimed = 0usize;
+
+    let mut handles = Vec::new();
+    for client in clients.clone() {
+        let semaphore = semaphore.clone();
+        let cache_path = cache_path.clone();
+        let progress = progress.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            let login = client.login.clone().unwrap_or_else(|| "unknown".to_string());
+            let count = verify_account_all_claimable(&client, &cache_path).await;
+            progress.inc(1);
+            progress.set_message(format!("{login}: claimed {count}"));
+            count
+        }));
+    }
+
+    for handle in handles {
+        if let Ok(count) = handle.await {
+            total_claimed += count;
+        }
+    }
+
+    if CLAIM_CHECK_ROUNDS > 1 && total_claimed > 0 {
+        for round in 2..=CLAIM_CHECK_ROUNDS {
+            info!("Claim check round {round}/{CLAIM_CHECK_ROUNDS}");
+            if CLAIM_CHECK_ROUND_DELAY_SECS > 0 {
+                sleep(Duration::from_secs(CLAIM_CHECK_ROUND_DELAY_SECS)).await;
+            }
+            progress.set_position(0);
+            progress.set_message("retrying...");
+
+            let mut retry_handles = Vec::new();
+            for client in clients.clone() {
+                let semaphore = semaphore.clone();
+                let cache_path = cache_path.clone();
+                let progress = progress.clone();
+
+                retry_handles.push(tokio::spawn(async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+                    let count = verify_account_all_claimable(&client, &cache_path).await;
+                    progress.inc(1);
+                    count
+                }));
+            }
+
+            for handle in retry_handles {
+                if let Ok(count) = handle.await {
+                    total_claimed += count;
+                }
+            }
+        }
+    }
+
+    progress.finish_with_message("done");
+    println!("\n✅ Claim check complete: {total_claimed} drops claimed across {} accounts", clients.len());
+
+    if total_claimed == 0 {
+        println!("No unclaimed drops found in inventory (or drops are not ready yet).");
+    }
+
+    Ok(())
 }
 async fn load_accounts_from_file(home_dir: &Path, config: &Config, proxies: &[String]) -> Result<(), Box<dyn Error>> {
     let accounts = config.loaded_accounts().await?;

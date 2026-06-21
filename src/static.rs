@@ -47,3 +47,18 @@ pub async fn retry_backup<F, Fut, T, E> (mut f: F) -> Result<T, E> where F: FnMu
         }
     }
 }
+
+pub async fn retry_or_log<F, Fut, T, E>(mut f: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match retry_backup(&mut f).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!("Retry failed after {MAX_ATTEMPTS} attempts: {error}");
+            None
+        }
+    }
+}
