@@ -24,10 +24,18 @@ pub static ALLOW_CHANNELS: Lazy<Arc<Mutex<HashMap<String, HashSet<Channels>>>>> 
 
 pub static CAMPAIGN_PRIORITY: Lazy<Arc<Mutex<HashMap<String, u32>>>> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// Retries the call; if every attempt fails, logs the error and `continue`s the enclosing loop
+/// instead of panicking (a panic here used to kill the whole farmer or an account's watch task).
 #[macro_export]
 macro_rules! retry {
     ($func:expr) => {
-        retry_backup(|| $func).await.expect("Retry failed after MAX_ATTEMPTS attempts")
+        match retry_backup(|| $func).await {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::error!("Retry failed after MAX_ATTEMPTS attempts: {e}");
+                continue;
+            }
+        }
     };
 }
 

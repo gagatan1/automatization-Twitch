@@ -526,10 +526,10 @@ fn account_cache_key(client: &Arc<TwitchClient>) -> String {
 
 async fn load_drop_cache(cache_path: &Path) -> Result<(), Box<dyn Error>> {
     if !cache_path.exists() {
-        retry!(fs::write(cache_path, "{}"));
+        fs::write(cache_path, "{}").await?;
     } else {
         let mut cache = DROP_CACHE.lock().await;
-        let cache_str = retry!(fs::read_to_string(cache_path));
+        let cache_str = fs::read_to_string(cache_path).await?;
         let cache_vec: HashMap<String, HashSet<String>> = serde_json::from_str(&cache_str).unwrap_or_default();
         *cache = cache_vec;
     }

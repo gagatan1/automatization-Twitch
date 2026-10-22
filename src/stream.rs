@@ -215,44 +215,60 @@ async fn spawn_ws (auth_token: String) {
                     match msg {
                         Ok(Message::Text(text)) => {
                             debug!("Received WebSocket message: {text}");
-                            if text.contains("\"type\":\"PING\"") {
-                                let pong = Message::Text("{\"type\":\"PONG\"}".into());
-                                write.send(pong).await.unwrap();
-                            }
-                            let json: Value = serde_json::from_str(&text).unwrap();
-                            if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
-                                if !err.is_empty() {
-                                    tracing::error!("{err}")
+                            let json: Value = match serde_json::from_str(&text) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::error!("Failed to parse JSON text: {e}");
+                                    continue;
                                 }
-                                continue;
-                            } else {
-                                let data = check_json(&json, "data").unwrap_or_else(|e| {tracing::error!("{e}"); &Value::Null});
-                                let message = check_json(&data, "message").unwrap_or_else(|e| {tracing::error!("{e}"); &Value::Null}).as_str().unwrap_or_default();
-                                let topic = check_json(data, "topic").unwrap_or_else(|e| { tracing::error!("{e}"); &Value::Null }).as_str().unwrap_or_default();
-                                let message_json: Value = serde_json::from_str(&message).unwrap();
-                                
-                                if let Some(viewers) = message_json.get("viewers").and_then(|s| s.as_u64()) {
-                                    debug!("Stream {} has {} viewers", topic, viewers);
-                                    if viewers == 0 {
-                                        if let Some(id_str) = topic.split('.').last() {
-                                            let mut channel_ids = CHANNEL_IDS.lock().await;
-                                            if let Some(to_remove) = channel_ids.iter().find(|channel| channel.channel_id == id_str).cloned() {
-                                                channel_ids.remove(&to_remove);
-                                            }
-                                            send_channels.retain(|channel| channel.channel_id != id_str );
+                            };
+                            let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            match msg_type {
+                                "PING" => {
+                                    let pong = Message::Text("{\"type\":\"PONG\"}".into());
+                                    write.send(pong).await.unwrap_or_else(|e| tracing::error!("Failed to send PONG to WebSocket: {e}"));
+                                },
+                                "PONG" => {},
+                                "RECONNECT" => {
+                                    tracing::warn!("Received RECONNECT from WebSocket, reconnecting...");
+                                    break;
+                                },
+                                "RESPONSE" => {
+                                    if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
+                                        if !err.is_empty() {
+                                            tracing::error!("WebSocket RESPONSE error: {err}");
                                         }
                                     }
-                                } else {
-                                    if let Some(id_str) = topic.split('.').last() {
-                                        let mut channel_ids = CHANNEL_IDS.lock().await;
-                                        if let Some(to_remove) = channel_ids.iter().find(|channel| channel.channel_id == id_str).cloned() {
-                                            channel_ids.remove(&to_remove);
-                                        };
-                                        send_channels.retain(|channel| channel.channel_id != id_str );
-                                    }
-                                }
-                            }
+                                },
+                                "MESSAGE" => {
+                                    let data = check_json(&json, "data").unwrap_or_else(|e| {tracing::error!("{e}"); &Value::Null});
+                                    let message = data.get("message").and_then(|m| m.as_str()).unwrap_or_default();
+                                    let topic = data.get("topic").and_then(|t| t.as_str()).unwrap_or_default();
+                                    let message_json: Value = match serde_json::from_str(message) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            tracing::error!("Failed to parse message JSON for topic {topic}: {e}");
+                                            continue;
+                                        }
+                                    };
 
+                                    let went_offline = match message_json.get("viewers").and_then(|s| s.as_u64()) {
+                                        Some(viewers) => {
+                                            debug!("Stream {} has {} viewers", topic, viewers);
+                                            viewers == 0
+                                        },
+                                        None => true,
+                                    };
+                                    if went_offline {
+                                        if let Some(id_str) = topic.split('.').last() {
+                                            let mut channel_ids = CHANNEL_IDS.lock().await;
+                                            channel_ids.retain(|channel| channel.channel_id != id_str);
+                                            send_channels.retain(|channel| channel.channel_id != id_str);
+                                        }
+                                    }
+                                },
+                                _ => debug!("Received unknown WebSocket message type: {msg_type}"),
+                            }
                         },
                         Ok(Message::Ping(ping)) => write.send(Message::Pong(ping)).await.unwrap_or_else(|e| tracing::error!("Failed to send PONG to WebSocket: {e}")),
                         Ok(_) => {},
