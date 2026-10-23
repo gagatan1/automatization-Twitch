@@ -79,7 +79,17 @@ async fn create_client(home_dir: &Path, proxies: &[String]) -> Result<(), Box<dy
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        tracing::error!("{e}");
+        eprintln!("\nError: {e}");
+        // Keep the console window open when the exe was started by double-click.
+        eprintln!("Press Enter to exit...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     // ... (весь main оставлен почти без изменений, только мелкие правки)
     let file_appender = rolling::never(".", "app.log");
     tracing_subscriber::fmt().with_writer(BoxMakeWriter::new(file_appender)).with_ansi(false).with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into())).init();
@@ -125,51 +135,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let items = vec!["Add account", "Start farming", "Check & claim drops"];
     loop {
-        let select = if !games.is_empty() {
-            1
-        } else {
-            dialoguer::Select::new().with_prompt("Select option").items(&items).default(0).interact()?
+        let select = dialoguer::Select::new().with_prompt("Select option").items(&items).default(1).interact()?;
+
+        let result: Result<(), Box<dyn Error>> = match select {
+            0 => create_client(&home_dir, &proxies).await,
+            1 => start_farming(home_dir, &games, &config, &proxies).await,
+            2 => claim_check_logic(home_dir).await,
+            _ => Ok(()),
         };
 
-        match select {
-            0 => {
-                create_client(&home_dir, &proxies).await?;
-            },
-            1 => {
-                let clients = ACCOUNTS.lock().await;
-                let client = if let Some(accounts) = &*clients {
-                    accounts.first().cloned().ok_or("No accounts loaded")?
-                } else {
-                    return Err("Didn't find accounts".into());
-                };
-                drop(clients);
-
-                let campaign = client.get_campaign().await?;
-                let campaign = campaign.dropCampaigns;
-
-                let mut id_to_index = HashMap::new();
-                let mut grouped: BTreeMap<usize, VecDeque<DropCampaigns>> = BTreeMap::new();
-                let mut next_index: usize = 0;
-                for obj in campaign {
-                    if obj.status == "EXPIRED" {
-                        continue;
-                    }
-                    let idx = *id_to_index.entry(obj.game.id.clone()).or_insert_with(|| {
-                        let i = next_index;
-                        next_index += 1;
-                        i
-                    });
-                    grouped.entry(idx).or_default().push_front(obj);
-                }
-
-                main_logic(client, grouped, home_dir, &games, config.discord_webhook_url.clone(), &proxies).await?;
-            },
-            2 => {
-                claim_check_logic(home_dir).await?;
-            },
-            _ => {}
+        if let Err(e) = result {
+            tracing::error!("{e}");
+            println!("\nError: {e}\n");
         }
     }
+}
+
+async fn start_farming(home_dir: &Path, games: &VecDeque<String>, config: &Config, proxies: &[String]) -> Result<(), Box<dyn Error>> {
+    let clients = ACCOUNTS.lock().await;
+    let client = if let Some(accounts) = &*clients {
+        accounts.first().cloned().ok_or("No accounts loaded")?
+    } else {
+        return Err("Didn't find accounts".into());
+    };
+    drop(clients);
+
+    let campaign = client.get_campaign().await?;
+    let campaign = campaign.dropCampaigns;
+
+    let mut id_to_index = HashMap::new();
+    let mut grouped: BTreeMap<usize, VecDeque<DropCampaigns>> = BTreeMap::new();
+    let mut next_index: usize = 0;
+    for obj in campaign {
+        if obj.status == "EXPIRED" {
+            continue;
+        }
+        let idx = *id_to_index.entry(obj.game.id.clone()).or_insert_with(|| {
+            let i = next_index;
+            next_index += 1;
+            i
+        });
+        grouped.entry(idx).or_default().push_front(obj);
+    }
+
+    main_logic(client, grouped, home_dir, games, config.discord_webhook_url.clone(), proxies).await
 }
 
 async fn main_logic(
@@ -180,7 +189,29 @@ async fn main_logic(
     webhook_url: String,
     proxies: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    let current_campaigns: VecDeque<VecDeque<DropCampaigns>> = if !games.is_empty() {
+    let mut game_names: Vec<String> = Vec::new();
+    let mut game_campaigns: Vec<VecDeque<DropCampaigns>> = Vec::new();
+    for campaigns in grouped.values() {
+        if let Some(campaign) = campaigns.front() {
+            game_names.push(campaign.game.displayName.clone());
+            game_campaigns.push(campaigns.clone());
+        }
+    }
+
+    if game_names.is_empty() {
+        return Err("Twitch returned no active drop campaigns for this account".into());
+    }
+
+    let mut options = Vec::new();
+    if !games.is_empty() {
+        options.push(format!("Games from games.txt ({})", games.iter().cloned().collect::<Vec<_>>().join(", ")));
+    }
+    options.extend(game_names.iter().cloned());
+
+    println!("\n=== Available games for drops ===");
+    let choice = dialoguer::Select::new().with_prompt("Select game").items(&options).default(0).interact()?;
+
+    let current_campaigns: VecDeque<VecDeque<DropCampaigns>> = if !games.is_empty() && choice == 0 {
         games.iter().filter_map(|game_name| {
             let campaigns_for_game: VecDeque<_> = grouped.values().flat_map(|campaigns_vec| {
                 campaigns_vec.iter().filter(|campaign| {
@@ -190,30 +221,12 @@ async fn main_logic(
             if campaigns_for_game.is_empty() { None } else { Some(campaigns_for_game) }
         }).collect()
     } else {
-        println!("\n=== Available games for drops ===");
-        let mut printed = std::collections::HashSet::new();
-        for (id, campaigns) in &grouped {
-            if let Some(campaign) = campaigns.front() {
-                let name = &campaign.game.displayName;
-                if printed.insert(name) {
-                    println!("{} | {}", id, name);
-                }
-            }
-        }
-
-        let input: usize = dialoguer::Input::new().with_prompt("Select game (enter the number)").interact_text()?;
-        let selected = match grouped.get(&input) {
-            Some(c) => c.clone(),
-            None => return Err("Invalid game selection".into()),
-        };
-        if selected.is_empty() {
-            return Err("No campaigns for selected game".into());
-        }
-        vec![selected].into_iter().collect()
+        let idx = if games.is_empty() { choice } else { choice - 1 };
+        vec![game_campaigns[idx].clone()].into_iter().collect()
     };
 
     if current_campaigns.is_empty() {
-        return Err("No campaigns found for the selected game".into());
+        return Err("None of the games in games.txt has active drops right now. Pick a game from the list instead".into());
     }
 
     // ... (весь остальной код main_logic остаётся как у тебя, только исправляем опечатку)
