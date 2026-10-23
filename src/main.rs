@@ -19,6 +19,8 @@ const STREAM_SLEEP: u64 = 59;
 const MAX_COUNT: u64 = 3;
 const BROADCAST_CHANNEL_CAPACITY: usize = 4096;
 const DROP_SYNC_POLL_SECS: u64 = 30;
+// 10 polls * 30s = 5 minutes on a channel with no drop session before asking for another channel.
+const EMPTY_DROP_POLLS_BEFORE_SWITCH: u32 = 10;
 const CLAIM_CHECK_CONCURRENCY: usize = 50;
 const CLAIM_CHECK_ROUNDS: u32 = 1;
 const CLAIM_CHECK_ROUND_DELAY_SECS: u64 = 0;
@@ -391,14 +393,23 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
             let mut watching = rx_watch.recv().await.unwrap();
             let mut last_drop_id = String::new();
             let mut last_known_drop_id = String::new();
+            // Twitch reports no current drop session until a few minute-watched events have landed
+            // on a new channel, so an empty dropID right after switching is expected, not a reason to switch again.
+            let mut empty_polls: u32 = 0;
+            let mut switch_requested = false;
             loop {
                 match rx_watch.try_recv() {
                     Err(TryRecvError::Closed) => break,
                     Ok(new_watch) => {
+                        let previous_login = watching.channel_login.clone();
                         watching = new_watch;
                         last_drop_id.clear();
                         while let Ok(channel) = rx_watch.try_recv() {
                             watching = channel;
+                        }
+                        if watching.channel_login != previous_login {
+                            empty_polls = 0;
+                            switch_requested = false;
                         }
                     }
                     Err(_) => {}
@@ -521,10 +532,18 @@ async fn drop_sync(clients: Vec<Arc<TwitchClient>>, tx: Sender<String>, cache_pa
                 bar.set_length(drop_progress.requiredMinutesWatched.max(1));
                 bar.set_position(drop_progress.currentMinutesWatched);
 
-                if drop_progress.dropID.is_empty()
-                    || (drop_progress.currentMinutesWatched >= drop_progress.requiredMinutesWatched
-                        && !drop_progress.dropID.is_empty())
-                {
+                if drop_progress.dropID.is_empty() {
+                    empty_polls += 1;
+                } else {
+                    empty_polls = 0;
+                }
+
+                let channel_exhausted = (drop_progress.dropID.is_empty() && empty_polls >= EMPTY_DROP_POLLS_BEFORE_SWITCH)
+                    || (!drop_progress.dropID.is_empty()
+                        && drop_progress.currentMinutesWatched >= drop_progress.requiredMinutesWatched);
+
+                if channel_exhausted && !switch_requested {
+                    switch_requested = true;
                     debug!(
                         "Farm progress: dropID: {}, currentMinutesWatched: {}, requiredMinutesWatched: {}, farmed: {:?}",
                         drop_progress.dropID,
