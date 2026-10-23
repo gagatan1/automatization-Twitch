@@ -284,6 +284,13 @@ async fn main_logic(
         }
     }
 
+    if pending_drops.is_empty() {
+        // Campaign details could not be read (or every drop is already claimed). The watch
+        // tasks are already running, so keep farming instead of reporting a false "complete".
+        warn!("Could not determine pending drops from campaign details; farming continues until the window is closed");
+        std::future::pending::<()>().await;
+    }
+
     while !pending_drops.is_empty() {
         drop_id_rx.changed().await.ok();
         let drop_id = drop_id_rx.borrow().clone();
@@ -293,7 +300,12 @@ async fn main_logic(
     }
 
     info!("✅ Farming complete. Use \"Check & claim drops\" in the menu to collect rewards.");
-    Ok(())
+    // The watch/progress tasks spawned above cannot be stopped, so returning to the menu and
+    // starting again would run every account twice. Exit instead; restart to claim drops.
+    println!("\n✅ Farming complete. Restart the program and choose \"Check & claim drops\" to collect rewards.");
+    println!("Press Enter to exit...");
+    let _ = std::io::stdin().read_line(&mut String::new());
+    std::process::exit(0);
 }
 
 async fn watch_sync (clients: Vec<Arc<TwitchClient>>, rx: Receiver<Channel>, notify: Arc<Notify>) {
