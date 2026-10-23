@@ -12,6 +12,7 @@ mod r#static;
 mod stream;
 mod config;
 mod webhook;
+mod hls;
 
 use crate::{config::*, r#static::*, stream::*, webhook::{WebhookSendFormat, webhook_message_worker}};
 
@@ -314,6 +315,8 @@ async fn watch_sync (clients: Vec<Arc<TwitchClient>>, rx: Receiver<Channel>, not
     for client in clients {
         let mut rx = rx.resubscribe();
         let notify = notify.clone();
+        let (segment_tx, segment_rx) = tokio::sync::watch::channel(String::new());
+        hls::spawn_segment_watcher(client.clone(), segment_rx);
         tokio::spawn(async move {
             let mut old_stream_name = String::new();
             let mut now_watching_stream: Option<(String, String, String)> = None;
@@ -335,6 +338,7 @@ async fn watch_sync (clients: Vec<Arc<TwitchClient>>, rx: Receiver<Channel>, not
                     info!("Now actively watching channel {}", watching.channel_login);
                     old_stream_name = watching.channel_login.clone();
                     now_watching_stream = None;
+                    let _ = segment_tx.send(watching.channel_login.clone());
                 }
 
                 let (stream_id, game_name, game_id) = match &now_watching_stream {
